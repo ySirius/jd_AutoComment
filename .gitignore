@@ -140,3 +140,6 @@ config.yml
 # images
 *.jpg
 *.txt
+# Local runtime artifacts (may contain account data)
+/log/
+/img/

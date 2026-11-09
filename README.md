@@ -44,7 +44,7 @@ cd jd_AutoComment
 pip install -r requirements.txt
 ```
 
-`https://club.jd.com/myJdcomments/myJdcomment.action`打开该链接，登录账号后获取 xhr 请求下的 `cookie`，`全部`填入配置文件。可以选择填入默认配置文件 `config.yml` ；也可以填入用户配置文件 `config.user.yml` （需要新建后将 `config.yml` 中的内容复制到该文件中），避免后续的更新覆盖 `config.yml` 中的内容。
+`https://club.jd.com/myJdcomments/myJdcomment.action`打开该链接，登录账号后获取 xhr 请求下的 `cookie`。将 `config.example.yml` 复制为 `config.user.yml`，再将完整 Cookie 填入本地配置。程序优先读取 `config.user.yml`，也兼容本地 `config.yml`。这两个配置文件均不纳入 Git，请勿提交 Cookie、Token 或包含登录信息的日志。
 
 需要填入如下内容：
 

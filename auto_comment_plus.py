@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse, uuid
 import copy
 import logging
+import mimetypes
 import os
 import random
 import sys
@@ -21,6 +22,9 @@ import requests
 import yaml
 from lxml import etree
 
+from curl_cffi import requests as cffi_req
+from curl_cffi.requests.exceptions import RequestException as CffiRequestException
+
 import jdspider
 
 # from http2_adapter import Http2Adapter
@@ -32,6 +36,7 @@ ORDINARY_SLEEP_SEC = 10
 SUNBW_SLEEP_SEC = 5
 REVIEW_SLEEP_SEC = 10
 SERVICE_RATING_SLEEP_SEC = 15
+MIN_COMMENT_LENGTH = 80
 
 # 默认评价模板
 DEFAULT_COMMENTS = [
@@ -156,7 +161,7 @@ def download_image(img_url: str, file_name: str) -> str | None:
     Returns:
         文件路径，失败返回None
     """
-    full_url = f"https:{img_url}"
+    full_url = f"https:{img_url}" if img_url.startswith("//") else img_url
     try:
         response = requests.get(full_url, timeout=30)
         response.raise_for_status()
@@ -164,14 +169,18 @@ def download_image(img_url: str, file_name: str) -> str | None:
         print(f"Failed to download image: {e}")
         return None
     
-    directory = "img"
-    os.makedirs(directory, exist_ok=True)
-    file_path = os.path.join(directory, file_name)
-    
-    with open(file_path, "wb") as file:
-        file.write(response.content)
-    
-    return file_path
+    if not response.content:
+        return None
+    try:
+        directory = "img"
+        os.makedirs(directory, exist_ok=True)
+        file_path = os.path.join(directory, file_name)
+        with open(file_path, "wb") as file:
+            file.write(response.content)
+        return file_path
+    except OSError as e:
+        print(f"Failed to save image: {e}")
+        return None
 
 
 # 上传图片到JD接口
@@ -187,26 +196,88 @@ def upload_image(filename: str, file_path: str, session: requests.Session, heade
     Returns:
         响应对象，失败返回None
     """
+    # multipart 的 boundary 必须由 requests 生成，不能沿用表单请求头。
+    upload_headers = {
+        key: value for key, value in headers.items()
+        if key.lower() not in {"content-type", "content-length"}
+    }
     try:
-        files = {
-            "name": (None, filename),
-            "Filedata": (file_path, open(file_path, "rb"), "image/jpeg"),
-        }
-        
-        response = session.post(
-            "https://club.jd.com/myJdcomments/ajaxUploadImage.action",
-            headers=headers,
-            files=files,
-            timeout=30
-        )
-        return response
-    except requests.RequestException as e:
+        with open(file_path, "rb") as image:
+            files = {
+                "name": (None, filename),
+                "Filedata": (
+                    filename, image,
+                    mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                ),
+            }
+            response = session.post(
+                "https://club.jd.com/myJdcomments/ajaxUploadImage.action",
+                headers=upload_headers,
+                files=files,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response
+    except (requests.RequestException, OSError) as e:
         print(f"Failed to upload image: {e}")
         return None
-    finally:
-        # 确保文件被关闭
-        if 'files' in locals():
-            files["Filedata"][1].close()
+
+
+def uploaded_image_url(response: requests.Response | None) -> str | None:
+    """将上传接口返回的图片路径转换为评论 imgs 所需的地址。"""
+    if response is None or response.status_code != 200:
+        return None
+    path = response.text.strip().strip('"')
+    if not path or any(char.isspace() or char in '<>"' for char in path):
+        return None
+    if path.startswith("jfs/"):
+        path = "//img20.360buyimg.com/shaidan/s645x515_" + path
+    try:
+        parsed = urllib.parse.urlsplit(path)
+        host = parsed.hostname or ""
+    except ValueError:
+        return None
+    if parsed.scheme not in {"", "http", "https"}:
+        return None
+    if not host.endswith(".360buyimg.com"):
+        return None
+    if not parsed.path.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        return None
+    return path
+
+
+def prepare_comment_images(imgdata: dict, session: requests.Session,
+                           request_headers: dict, logger=None) -> list[str]:
+    """最多上传两张图片，仅返回上传成功的地址；有图但全部失败时阻止提交。"""
+    if not isinstance(imgdata, dict) or not isinstance(imgdata.get("imgComments"), dict):
+        raise ValueError("图片接口返回的数据格式无效")
+    comments = imgdata["imgComments"]
+    images = comments.get("imgList")
+    if comments.get("imgCommentCount") in (0, "0") and not images:
+        return []
+    if not isinstance(images, list) or not images:
+        raise ValueError("图片接口未返回有效图片列表")
+
+    uploaded = []
+    for image in images[:2]:
+        source = image.get("imageUrl") if isinstance(image, dict) else None
+        if not isinstance(source, str) or not source:
+            continue
+        filename = generate_unique_filename()
+        local_path = download_image(source, filename)
+        if not local_path:
+            if logger:
+                logger.warning("图片下载失败，跳过该图片")
+            continue
+        response = upload_image(filename, local_path, session, request_headers)
+        image_url = uploaded_image_url(response)
+        if image_url:
+            uploaded.append(image_url)
+        elif logger:
+            logger.warning("图片上传失败或返回了无效的图片地址")
+    if not uploaded:
+        raise ValueError("图片全部下载或上传失败，保留该商品待评价，避免提交无图评论")
+    return uploaded
 
 
 # 评价生成
@@ -284,17 +355,43 @@ def generation(pname: str, _class: int = 0, _type: int = 1, opts: dict | None = 
             logger.debug("_class is 1. Directly return name")
         return name
     
-    # 生成评价内容
-    num = 6 if _type == 1 else 4
-    num = min(num, len(result))
-    comments = "".join(random.sample(result, num))
-    
+    # 普通评价按替换商品名后的实际长度生成，保留完整句子。
+    if _type == 1:
+        fallback = GIFT_COMMENTS if any(
+            keyword in pname for keyword in ["赠品", "非实物", "增值服务"]
+        ) else DEFAULT_COMMENTS
+        selected = []
+        seen = set()
+        length = 0
+        for pool in (result, fallback):
+            candidates = list(pool)
+            random.shuffle(candidates)
+            for sentence in candidates:
+                if not isinstance(sentence, str):
+                    continue
+                sentence = "".join(sentence.replace("$", name).split())
+                if not sentence or sentence in seen:
+                    continue
+                seen.add(sentence)
+                if sentence[-1] not in "。！？.!?":
+                    sentence += "。"
+                selected.append(sentence)
+                length += len(sentence)
+                if length >= MIN_COMMENT_LENGTH:
+                    break
+            if length >= MIN_COMMENT_LENGTH:
+                break
+        comments = "".join(selected)
+    else:
+        num = min(4, len(result))
+        comments = "".join(random.sample(result, num)).replace("$", name)
+
     if logger:
         logger.debug("_type: %d", _type)
-        logger.debug("num: %d", num)
+        logger.debug("Comment length: %d", len(comments))
         logger.debug("Raw comments: %s", comments)
 
-    return 5, comments.replace("$", name)
+    return 5, comments
 
 
 # 查询全部评价
@@ -386,7 +483,6 @@ def ordinary(N: dict[str, int], opts: dict | None = None) -> dict[str, int]:
     
     Order_data = []
     req_et_list = []
-    imgCommentCount_bool = True
     loop_times = N.get("待评价订单", 0) // 20
     
     if logger:
@@ -497,85 +593,27 @@ def ordinary(N: dict[str, int], opts: dict | None = None) -> dict[str, int]:
             if logger:
                 logger.info(f"\t\t评价内容,星级{xing}：" + Str)
             
-            # 获取图片
-            if logger:
-                logger.info(f"\t\t开始获取图片")
-            
+            # 每个商品独立获取并上传图片，提交上传接口返回的新地址。
             img_url = f"https://club.jd.com/discussion/getProductPageImageCommentList.action?productId={pid}"
-            if logger:
-                logger.debug("URL: %s", img_url)
-            
             try:
                 img_resp = requests.get(img_url, headers=headers, timeout=30)
                 img_resp.raise_for_status()
+                with requests.Session() as session:
+                    image_urls = prepare_comment_images(
+                        img_resp.json(), session, headers, logger
+                    )
+            except (requests.RequestException, ValueError) as e:
                 if logger:
-                    logger.debug("Successfully accepted the response with status code %d", img_resp.status_code)
-            except requests.RequestException as e:
-                if logger:
-                    logger.warning("Failed to fetch images: %s", e)
-                imgCommentCount_bool = False
-                imgurl = ""
-            else:
-                if logger:
-                    logger.info("imgdata_url:" + img_url)
-                
-                imgdata = img_resp.json()
-                if logger:
-                    logger.debug("Image data: %s", imgdata)
-                
-                if imgdata["imgComments"]["imgCommentCount"] == 0:
-                    if logger:
-                        logger.warning("这单没有图片数据，所以直接默认五星好评！！")
-                    imgCommentCount_bool = False
-                    imgurl = ""
-                elif imgdata["imgComments"]["imgCommentCount"] > 0:
-                    imgurl1 = imgdata["imgComments"]["imgList"][0]["imageUrl"]
-                    imgurl2 = imgdata["imgComments"]["imgList"][1]["imageUrl"]
-                    
-                    if logger:
-                        logger.info("imgurl1 url: %s", imgurl1)
-                        logger.info("imgurl2 url: %s", imgurl2)
-                    
-                    session = requests.Session()
-                    imgBasic = "//img20.360buyimg.com/shaidan/s645x515_"
-                    
-                    # 下载并上传第一张图片
-                    imgName1 = generate_unique_filename()
-                    if logger:
-                        logger.debug(f"Image :{imgName1}")
-                    
-                    downloaded_file1 = download_image(imgurl1, imgName1)
-                    if downloaded_file1:
-                        imgPart1 = upload_image(imgName1, downloaded_file1, session, headers)
-                        if imgPart1 and imgPart1.status_code == 200 and ".jpg" in imgPart1.text:
-                            imgurl1t = f"{imgBasic}{imgPart1.text}"
-                        else:
-                            if logger:
-                                logger.info("上传图片1失败")
-                            imgurl1 = ""
-                    
-                    # 下载并上传第二张图片
-                    imgName2 = generate_unique_filename()
-                    if logger:
-                        logger.debug(f"Image :{imgName2}")
-                    
-                    downloaded_file2 = download_image(imgurl2, imgName2)
-                    if downloaded_file2:
-                        imgPart2 = upload_image(imgName2, downloaded_file2, session, headers)
-                        if imgPart2 and imgPart2.status_code == 200 and ".jpg" in imgPart2.text:
-                            imgurl2t = f"{imgBasic}{imgPart2.text}"
-                        else:
-                            if logger:
-                                logger.info("上传图片2失败")
-                            imgurl2 = ""
-                    
-                    imgurl = f"{imgurl1},{imgurl2}"
-                    if logger:
-                        logger.debug("Image URL: %s", imgurl)
-                        logger.info(f"\t\t图片url={imgurl}")
+                    logger.warning("商品 %s 图片处理失败，跳过本次评价：%s", pid, e)
+                continue
+
+            imgurl = ",".join(image_urls)
+            if logger:
+                if image_urls:
+                    logger.info("成功上传 %d 张图片，图片url=%s", len(image_urls), imgurl)
                 else:
-                    imgurl = ""
-            
+                    logger.warning("该商品没有可用图片，本次仅提交文字评价")
+
             # 准备评价数据
             Str_encoded = urllib.parse.quote(Str, safe="/", encoding=None, errors=None)
             Comment_data = {
@@ -587,7 +625,7 @@ def ordinary(N: dict[str, int], opts: dict | None = None) -> dict[str, int]:
                 "anonymousFlag": "1",
             }
             
-            if imgCommentCount_bool and imgurl:
+            if imgurl:
                 Comment_data["imgs"] = imgurl
             
             if logger:
@@ -599,11 +637,12 @@ def ordinary(N: dict[str, int], opts: dict | None = None) -> dict[str, int]:
                     logger.debug("Sending comment request")
                 
                 try:
-                    Comment_resp = requests.post(
+                    Comment_resp = cffi_req.post(
                         "https://club.jd.com/myJdcomments/saveProductComment.action",
                         headers=headers2,
                         data=Comment_data,
-                        timeout=30
+                        timeout=30,
+                        impersonate="chrome",
                     )
                     if logger:
                         logger.info(
@@ -618,7 +657,7 @@ def ordinary(N: dict[str, int], opts: dict | None = None) -> dict[str, int]:
                     else:
                         if logger:
                             logger.warning(f"\t{i}.评价订单\t{oname}[{oid}]评论失败")
-                except requests.RequestException as e:
+                except (requests.RequestException, CffiRequestException) as e:
                     if logger:
                         logger.error(f"Failed to submit comment: {e}")
                 except (ValueError, KeyError) as e:
@@ -879,10 +918,10 @@ def review(N: dict[str, int], opts: dict | None = None) -> dict[str, int]:
                 logger.debug("Sending comment request")
             
             try:
-                pj1 = requests.post(url1, headers=headers2, data=data1, timeout=30)
+                pj1 = cffi_req.post(url1, headers=headers2, data=data1, timeout=30, impersonate="chrome")
                 if logger:
                     logger.debug("发送请求后的状态码:{},text:{}".format(pj1.status_code, pj1.text))
-            except requests.RequestException as e:
+            except (requests.RequestException, CffiRequestException) as e:
                 if logger:
                     logger.error(f"Failed to submit review: {e}")
         else:
@@ -959,8 +998,8 @@ def Service_rating(N: dict[str, int], opts: dict | None = None) -> dict[str, int
             logger.debug("Count of fetched order data: %d", len(elems))
         Order_data.extend(elems)
     
-    # 如果第一次提取失败，尝试备用XPath
-    if len(Order_data) != N.get("服务评价", 0):
+    # 如果第一次提取结果为空，尝试备用XPath
+    if len(Order_data) == 0:
         if logger:
             logger.debug('Count of fetched order data doesn\'t equal N["服务评价"]')
             logger.debug("Clear the list Order_data")
@@ -974,7 +1013,7 @@ def Service_rating(N: dict[str, int], opts: dict | None = None) -> dict[str, int
                 logger.debug("Loop: %d / %d", idx + 1, len(req_et_list))
                 logger.debug("Fetching order data in another XPath")
             
-            elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table/tr[@class="tr-bd"]')
+            elems = html_tree.xpath('//*[@id="main"]/div[2]/div[2]/table/tbody/tr[@class="tr-bd"]')
             if logger:
                 logger.debug("Count of fetched order data: %d", len(elems))
             Order_data.extend(elems)
@@ -1023,10 +1062,10 @@ def Service_rating(N: dict[str, int], opts: dict | None = None) -> dict[str, int
                 logger.debug("Sending comment request")
             
             try:
-                pj1 = requests.post(url1, headers=headers, data=data1, timeout=30)
+                pj1 = cffi_req.post(url1, headers=headers, data=data1, timeout=30, impersonate="chrome")
                 if logger:
                     logger.info("\t\t " + pj1.text)
-            except requests.RequestException as e:
+            except (requests.RequestException, CffiRequestException) as e:
                 if logger:
                     logger.error(f"Failed to submit service rating: {e}")
         else:
@@ -1122,12 +1161,17 @@ def main(opts: dict | None = None) -> None:
     if logger:
         logger.info("全部完成啦！")
     
-    # 检查是否有未完成的评价，递归重试
+    # 检查是否有未完成的评价，最多重试一次，避免死循环
     for key in N:
         if N[key] != 0:
-            if logger:
-                logger.warning("出现了二次错误，跳过了部分，重新尝试")
-            main(opts)
+            if opts.get("_retried"):
+                if logger:
+                    logger.warning("仍有未完成评价，停止重试以免死循环：%s", N)
+            else:
+                if logger:
+                    logger.warning("出现了二次错误，跳过了部分，重新尝试")
+                opts["_retried"] = True
+                main(opts)
             break
 
 
@@ -1255,7 +1299,7 @@ if __name__ == "__main__":
             cfg = yaml.safe_load(f)
         if logger:
             logger.debug("Closed the configuration file")
-            logger.debug("Configurations in Python-dict format: %s", cfg)
+            logger.debug("Configuration loaded from: %s", _cfg_path)
     except Exception as e:
         if logger:
             logger.error("Failed to read configuration file: %s", e)
@@ -1270,7 +1314,6 @@ if __name__ == "__main__":
         "Cookie": ck.encode("utf-8"),
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/114.0.5735.110 Safari/537.36",
-        "Connection": "keep-alive",
         "Cache-Control": "max-age=0",
         "X-Requested-With": "XMLHttpRequest",
         "sec-ch-ua": "",
@@ -1295,7 +1338,7 @@ if __name__ == "__main__":
     }
     
     if logger:
-        logger.debug("Builtin HTTP request header: %s", headers)
+        logger.debug("HTTP request headers initialized")
         logger.debug("Starting main processes")
     
     # 执行主流程
